@@ -8,8 +8,9 @@ buffer without waiting for generation phases to complete.
 """
 
 import logging
+import threading
 from dataclasses import dataclass
-from typing import Iterator, Optional, Tuple
+from typing import Callable, Iterator, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -18,14 +19,17 @@ from torch.utils.data import Dataset
 logger = logging.getLogger(__name__)
 
 
+QuerySampler = Callable[[], torch.Tensor]
+
+
 @dataclass
 class Rollout:
     """Single PPO rollout trajectory."""
-    query_tokens: torch.Tensor          # (seq_length,)
-    response_tokens: torch.Tensor       # (response_length,)
-    reward: torch.Tensor                # scalar
-    logits_policy: torch.Tensor         # (response_length, vocab_size)
-    logits_reference: torch.Tensor      # (response_length, vocab_size)
+    query_tokens: torch.Tensor
+    response_tokens: torch.Tensor
+    reward: torch.Tensor
+    logits_policy: torch.Tensor
+    logits_reference: torch.Tensor
 
 
 class RolloutBuffer:
@@ -104,11 +108,21 @@ class RolloutCollator:
         # Rewards
         rewards = torch.stack([r.reward for r in rollouts])
         
+        query_tokens_list = [r.query_tokens for r in rollouts]
+        max_query_length = max(token.shape[0] for token in query_tokens_list)
+        padded_queries = self._pad_sequence(query_tokens_list, max_query_length)
+        query_lengths = torch.tensor([t.shape[0] for t in query_tokens_list], dtype=torch.long)
+
+        response_lengths = torch.tensor([r.response_tokens.shape[0] for r in rollouts], dtype=torch.long)
+
         return {
+            "query_tokens": padded_queries,
             "response_tokens": padded_responses,
             "logits_policy": padded_logits_policy,
             "logits_reference": padded_logits_reference,
             "rewards": rewards,
+            "query_lengths": query_lengths,
+            "response_lengths": response_lengths,
         }
 
     @staticmethod
@@ -162,49 +176,65 @@ class RolloutGenerator:
         response_tokens_list = []
         logits_policy_list = []
         logits_reference_list = []
-        
+
         current_tokens = query_tokens.clone()
-        
+
         for _ in range(self.max_response_length):
             # Policy forward pass
             policy_out = self.policy_model(current_tokens)
-            policy_logits = policy_out.logits[:, -1, :]  # (batch, vocab_size)
-            
+            policy_logits = policy_out.logits[:, -1, :]
+
             # Reference forward pass
             ref_out = self.reference_model(current_tokens)
             ref_logits = ref_out.logits[:, -1, :]
-            
+
             logits_policy_list.append(policy_logits)
             logits_reference_list.append(ref_logits)
-            
-            # Sample next token (temperature + top_p sampling)
+
             next_token = self._sample_token(
                 policy_logits,
                 temperature=self.temperature,
-                top_p=self.top_p
+                top_p=self.top_p,
             )
             response_tokens_list.append(next_token)
             current_tokens = torch.cat([current_tokens, next_token.unsqueeze(1)], dim=1)
-        
-        # Compute reward on full (query + response) text
-        response_tokens = torch.stack(response_tokens_list, dim=1)  # (batch, response_length)
-        
+
+        response_tokens = torch.cat(response_tokens_list, dim=1)
+        logits_policy = torch.stack(logits_policy_list, dim=1)
+        logits_reference = torch.stack(logits_reference_list, dim=1)
+
         with torch.no_grad():
             reward_input = torch.cat([query_tokens, response_tokens], dim=1)
             reward_out = self.reward_model(reward_input)
-            rewards = reward_out.logits.squeeze(-1)  # (batch,)
-        
-        # Stack logits
-        logits_policy = torch.stack(logits_policy_list, dim=1)      # (batch, response_length, vocab_size)
-        logits_reference = torch.stack(logits_reference_list, dim=1)
-        
-        return {
-            "query_tokens": query_tokens,
-            "response_tokens": response_tokens,
-            "logits_policy": logits_policy,
-            "logits_reference": logits_reference,
-            "rewards": rewards,
-        }
+            rewards = self._decode_reward(reward_out)
+
+        rollouts = []
+        for index in range(query_tokens.shape[0]):
+            rollouts.append(
+                Rollout(
+                    query_tokens=query_tokens[index].detach().cpu(),
+                    response_tokens=response_tokens[index].detach().cpu(),
+                    logits_policy=logits_policy[index].detach().cpu(),
+                    logits_reference=logits_reference[index].detach().cpu(),
+                    reward=rewards[index].detach().cpu(),
+                )
+            )
+
+        return rollouts
+
+    @staticmethod
+    def _decode_reward(reward_out: object) -> torch.Tensor:
+        if hasattr(reward_out, "logits"):
+            logits = reward_out.logits
+            if logits.dim() == 2:
+                return logits.squeeze(-1)
+            if logits.dim() == 3:
+                return logits.mean(dim=-1).mean(dim=-1)
+
+        if hasattr(reward_out, "pooler_output"):
+            return reward_out.pooler_output.mean(dim=-1)
+
+        raise RuntimeError("Unsupported reward model output shape")
 
     @staticmethod
     def _sample_token(
@@ -213,24 +243,20 @@ class RolloutGenerator:
         top_p: float = 0.9,
     ) -> torch.Tensor:
         """Sample next token using temperature + top-p (nucleus) sampling."""
-        # Temperature scaling
         scaled_logits = logits / temperature
-        
-        # Top-p sampling
-        probs = F.softmax(scaled_logits, dim=-1)
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
-        
-        # Find cutoff: include all tokens where cumulative prob <= top_p
-        sorted_indices_to_remove = cumsum_probs > top_p
-        sorted_indices_to_remove[..., 0] = False  # Keep at least one token
-        
-        indices_to_remove = sorted_indices[sorted_indices_to_remove]
-        scaled_logits[:, indices_to_remove] = float("-inf")
-        
-        # Sample
+        if top_p < 1.0:
+            probs = F.softmax(scaled_logits, dim=-1)
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            cutoff_mask = cumulative_probs > top_p
+            cutoff_mask[..., 0] = False
+
+            remove_mask = torch.zeros_like(logits, dtype=torch.bool)
+            remove_mask.scatter_(dim=-1, index=sorted_indices, src=cutoff_mask)
+            scaled_logits = scaled_logits.masked_fill(remove_mask, float("-inf"))
+
         token = torch.multinomial(F.softmax(scaled_logits, dim=-1), num_samples=1)
-        return token
+        return token.squeeze(-1)
 
 
 class AsyncRolloutPipeline:
@@ -246,12 +272,17 @@ class AsyncRolloutPipeline:
         self,
         generator: RolloutGenerator,
         buffer: RolloutBuffer,
+        query_sampler: Optional[QuerySampler] = None,
+        batch_size: int = 1,
         num_generator_threads: int = 2,
     ):
         self.generator = generator
         self.buffer = buffer
+        self.query_sampler = query_sampler
+        self.batch_size = batch_size
         self.num_generator_threads = num_generator_threads
-        self.stop_event = False
+        self.stop_event = threading.Event()
+        self.generator_threads: List[threading.Thread] = []
 
     def start_generators(self) -> None:
         """Start background generator threads."""
@@ -266,17 +297,33 @@ class AsyncRolloutPipeline:
     def _generator_loop(self, thread_id: int) -> None:
         """Run generation loop in background thread."""
         logger.info(f"Generator thread {thread_id} started.")
-        while not self.stop_event:
+        while not self.stop_event.is_set():
             try:
-                # Generate a rollout
-                # (In practice, you'd sample queries from a dataset)
-                pass
+                if self.query_sampler is None:
+                    logger.warning("No query sampler configured for AsyncRolloutPipeline.")
+                    break
+
+                query_batch = self.query_sampler()
+                if query_batch is None:
+                    logger.debug("Query sampler returned no input; sleeping briefly.")
+                    import time
+                    time.sleep(0.5)
+                    continue
+
+                query_batch = query_batch.to(next(self.generator.policy_model.parameters()).device)
+                rollouts = self.generator.generate_rollout(query_batch)
+                for rollout in rollouts:
+                    self.buffer.add(rollout)
+
+                if self.buffer.is_full():
+                    import time
+                    time.sleep(0.1)
             except Exception as e:
                 logger.error(f"Generator thread {thread_id} error: {e}", exc_info=True)
 
     def stop_generators(self) -> None:
         """Stop all generator threads."""
-        self.stop_event = True
+        self.stop_event.set()
         for thread in self.generator_threads:
             thread.join(timeout=5.0)
         logger.info("Generator threads stopped.")

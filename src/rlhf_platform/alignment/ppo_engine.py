@@ -98,18 +98,17 @@ class DistributedPPOEngine:
             if isinstance(batch[key], torch.Tensor):
                 batch[key] = batch[key].to(device)
         
-        # Zero gradients
         self.optimizer.zero_grad()
         
-        # Forward pass: Actor, Critic, Reference models
-        actor_out = self.actor_model(batch["response_tokens"])
-        critic_out = self.critic_model(batch["response_tokens"])
+        input_ids = torch.cat([batch["query_tokens"], batch["response_tokens"]], dim=1)
+        
+        actor_out = self.actor_model(input_ids)
+        critic_out = self.critic_model(input_ids)
         
         with torch.no_grad():
-            reference_out = self.reference_model(batch["response_tokens"])
+            reference_out = self.reference_model(input_ids)
         
-        # Compute log probabilities
-        actor_logits = actor_out.logits
+        actor_logits = actor_out.logits[:, -batch["response_tokens"].shape[1]:, :]
         critic_values = critic_out.logits.squeeze(-1) if critic_out.logits.dim() > 1 else critic_out.logits
         
         new_log_probs = F.log_softmax(actor_logits, dim=-1)
