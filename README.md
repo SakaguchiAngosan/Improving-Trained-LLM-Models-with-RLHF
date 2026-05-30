@@ -109,6 +109,38 @@ src/rlhf_platform/
 
 ---
 
+## 📚 Technical Documentation Hub
+
+The framework is accompanied by an enterprise-grade engineering specification suite located in the `/docs` directory. Review these deep dives for detailed implementation, scaling, and operational runbooks:
+
+```text
+📂 docs/
+
+├── 🧬 core/
+│   ├── ARCHITECTURE.md     # Core system execution flows, module boundaries & dependency layers
+│   └── philosophy.md       # Core engineering ethos: Lane A/B design paradigms & scaling laws
+
+├── ⚡ operations/
+│   ├── system_design.md    # Multi-node hardware specifications, NVLink/InfiniBand topologies & RDMA maps
+│   └── setup.md            # Industrial cluster deployment runbook: SLURM, Kubernetes & NCCL network parameters
+
+└── 🛡️ governance/
+    ├── security.md         # Threat modeling: Reward hacking mitigation, queue poisoning & secure checkpointers
+    └── contributing.md     # Production engineering gates: ruff/mypy validation, shape variance & regression testing
+```
+
+| Specification Document | Hardened Engineering Focus | Target Audience |
+| :--- | :--- | :--- |
+| [**Architecture Specification**](docs/core/ARCHITECTURE.md) | Component lifecycles, execution topologies, and inter-module state machines. | Infrastructure Engineers |
+| [**System Design & Topology**](docs/operations/system_design.md) | Hardware co-design: NVLink saturation, GPUDirect RDMA, and NCCL communication paths. | Cluster Architects |
+| [**Deployment Runbook**](docs/operations/setup.md) | Production orchestrations: Bare-metal SLURM parameters, KubeFlow manifests, and NCCL tuning. | Site Reliability / DevOps |
+| [**Engineering Philosophy**](docs/core/philosophy.md) | Tradeoffs between async generation throughput and strict mathematical alignment bounds. | Research Directors |
+| [**Threat & Security Matrix**](docs/governance/security.md) | Defenses against adversarial reward optimization, tensor-overflow vectoring, and checkpoint leaks. | Security Specialists |
+| [**Contribution Protocols**](docs/governance/contributing.md) | Code quality gatekeeping: strict type invariant boundaries, shape-check assertions, and CI validation. | Core Contributors |
+```
+
+---
+
 ## 🧬 Mathematical & Algorithmic Foundation
 
 The engine optimizes the combined PPO-clip objective with an adaptive Kullback-Leibler (KL) divergence regularizer to prevent policy drift and reward hacking during scaling updates.
